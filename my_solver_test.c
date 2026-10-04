@@ -54,7 +54,15 @@ typedef struct {
     uint64_t packed_writes;
 } setup_counts_t;
 
+typedef struct {
+    uint64_t frame_pushes, frame_pops;
+    uint64_t restored_row_pairs;
+    uint64_t bound_cutoffs, depth_limit_leaves;
+} stack_counts_t;
+
 #ifdef MY_SOLVER_INSTRUMENT
+static stack_counts_t measured_stack;
+#define MY_SOLVER_STACK_COUNT(field) (++measured_stack.field)
 static setup_counts_t measured_setup;
 #define MY_SOLVER_SETUP_COUNT(field) (++measured_setup.field)
 static operation_counts_t measured_operations;
@@ -687,7 +695,7 @@ setter_failure:
     return 0;
 }
 
-/* Observe iteration count by calling the unchanged search() with exactly
+/* Observe iteration count by calling search() with exactly
  * solve()'s bounds, root face and path storage. This untimed second run must
  * reproduce the timed solve's length, path and expanded-node count.
  */
@@ -700,7 +708,7 @@ static int observe_iterations(ranked_state_t start, solution_t *solution,
     while (bound <= MAX_DEPTH) {
         ++*iterations;
         MY_SOLVER_COUNT(iterations);
-        int result = search(start, 0, bound, NONE, solution);
+        int result = search(start, bound, solution);
         if (result == FOUND)
             return 1;
         if (result == INT_MAX)
@@ -724,6 +732,7 @@ static int count_operations(ranked_state_t start, const solution_t *actual,
     memset(counts, 0, sizeof *counts);
 #ifdef MY_SOLVER_INSTRUMENT
     memset(&measured_operations, 0, sizeof measured_operations);
+    memset(&measured_stack, 0, sizeof measured_stack);
 #endif
     if (!observe_iterations(start, &observed, &counts->iterations) ||
         observed.length != actual->length || observed.nodes != actual->nodes ||
@@ -768,12 +777,59 @@ static int count_operations(ranked_state_t start, const solution_t *actual,
     counts->ori_transition_lookups = counts->generated_children;
     counts->heuristic_calls = counts->generated_children + counts->iterations + 1U;
 #ifdef MY_SOLVER_INSTRUMENT
+    uint64_t pushes = actual->length ? actual->nodes - counts->iterations : 0;
+    uint64_t pops = pushes - (actual->length ? actual->length - 1U : 0);
+    uint64_t cutoffs = counts->generated_children + counts->iterations -
+                       counts->expanded_nodes - 1U;
+    if (measured_stack.frame_pushes != pushes ||
+        measured_stack.frame_pops != pops ||
+        measured_stack.bound_cutoffs + measured_stack.depth_limit_leaves != cutoffs ||
+        measured_stack.restored_row_pairs > pops) {
+        fputs("fixed-stack accounting failed: hooks differ from node totals\n",
+              stderr);
+        return 0;
+    }
     if (memcmp(counts, &measured_operations, sizeof *counts)) {
         fputs("operation accounting failed: actual hooks differ from loop model\n",
               stderr);
         return 0;
     }
 #endif
+    return 1;
+}
+
+/* Exercise cutoff, minimum-exceeded propagation, exhaustion and early
+ * success separately from solve(). Compare every bound to recursion.
+ */
+static int bounded_search_test(void)
+{
+    static const char *const inputs[] = {
+        "12345671111111", "25314672313211", "21345671111111",
+        "54721631111111"
+    };
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; ++i) {
+        state_t state;
+        if (!parse_state(inputs[i], &state))
+            return 0;
+        ranked_state_t start = rank_coordinates(&state);
+        for (int bound = 0; bound <= MAX_DEPTH; ++bound) {
+            solution_t actual = {0}, reference = {0};
+            int result = search(start, bound, &actual);
+            int expected = search_reference(start, 0, bound, NONE, &reference);
+            if (result != expected || actual.nodes != reference.nodes ||
+                (result == FOUND &&
+                 (actual.length != reference.length ||
+                  memcmp(actual.moves, reference.moves, actual.length) ||
+                  !replay_solution(&state, &actual)))) {
+                fprintf(stderr, "bounded search mismatch: input=%s bound=%d "
+                                "result=%d expected=%d\n",
+                        inputs[i], bound, result, expected);
+                return 0;
+            }
+        }
+    }
+    puts("bounded search passed: all bounds 0..11 for solved, R, "
+         "required/worst distance-11; results, paths and expanded nodes match");
     return 1;
 }
 
@@ -875,6 +931,23 @@ static void report_operations(const operation_counts_t *counts)
            counts->perm_transition_lookups);
     printf("ori_transition_table_lookups=%" PRIu64 "\n",
            counts->ori_transition_lookups);
+    /* Counts are operations, not byte sizes or retired instructions. */
+    printf("search_calls=%" PRIu64 "\n", counts->iterations);
+    puts("recursive_search_calls=0\nnode_counter_updates_in_normal_core=0");
+#ifdef MY_SOLVER_INSTRUMENT
+    printf("frame_pushes=%" PRIu64 "\nframe_pops=%" PRIu64 "\n",
+           measured_stack.frame_pushes, measured_stack.frame_pops);
+    printf("frame_field_writes=%" PRIu64 "\nframe_field_reads=%" PRIu64 "\n",
+           8U * measured_stack.frame_pushes, 8U * measured_stack.frame_pops);
+    printf("restored_transition_row_pairs=%" PRIu64 "\n",
+           measured_stack.restored_row_pairs);
+    printf("bound_cutoffs_without_frame_write=%" PRIu64 "\n",
+           measured_stack.bound_cutoffs);
+    printf("depth_limit_leaves_without_frame_write=%" PRIu64 "\n",
+           measured_stack.depth_limit_leaves);
+#else
+    puts("stack_operation_counts=enable_MY_SOLVER_INSTRUMENT_for_direct_counts");
+#endif
     puts("apply_ranked_move_calls=0\nmove_div3_search=0\nmove_div3_apply=0\n"
          "move_div3_total=0\nmove_mod3_apply_loop_condition=0");
 }
@@ -1061,8 +1134,13 @@ static void report_memory(void)
     printf("host_search_statistics.node_counter_bytes=%zu\n",
            sizeof(((solution_t *) 0)->nodes));
     printf("host_search_statistics.context_bytes=%zu\n", sizeof(solution_t));
-    printf("search_path_storage.max_recursive_frames=%u\n", MAX_DEPTH + 1);
-    puts("search_path_storage.call_frame_bytes=compiler_dependent\n"
+    puts("target_core.recursive_search=false");
+    printf("search_stack.fixed_frames=%u\n", MAX_DEPTH + 1);
+    printf("search_stack.fields_per_frame=%u\n", 8U);
+    printf("search_stack.frame_bytes=%zu\n", sizeof(search_frame_t));
+    printf("search_stack.total_bytes=%zu\n", sizeof(search_frame_t[MAX_DEPTH + 1]));
+    puts("search_stack.storage=automatic_fixed_array\n"
+         "search_stack.locals_and_call_frame_bytes=compiler_dependent\n"
          "host_bfs_oracle_in_target_memory=false\n"
          "excluded=diagnostic_strings_code_linker_padding_call_frames_libc");
 }
@@ -1112,7 +1190,8 @@ int main(int argc, char **argv)
     }
     if (mode == 0) {
         if (!representation_test() || !h2_test(1) || !basic_search_test() ||
-            !distance_11_test() || !h4_test() || !operation_counts_test() ||
+            !distance_11_test() || !h4_test() || !bounded_search_test() ||
+            !operation_counts_test() ||
             !input_and_replay_test()) {
             fputs("self-test failed\n", stderr);
             return 1;

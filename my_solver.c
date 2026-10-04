@@ -7,6 +7,9 @@
 #ifndef MY_SOLVER_COUNT
 #define MY_SOLVER_COUNT(field) ((void) 0)
 #endif
+#ifndef MY_SOLVER_STACK_COUNT
+#define MY_SOLVER_STACK_COUNT(field) ((void) 0)
+#endif
 #ifndef MY_SOLVER_SETUP_COUNT
 #define MY_SOLVER_SETUP_COUNT(field) ((void) 0)
 #endif
@@ -14,6 +17,7 @@
 /* Optimal HTM IDA*: R/B/D generators, max(hp,ho), same-face pruning.
  * Persistent tables: 30240 + 4374 + 2520 + 365 = 37499 bytes.
  * Initialization scratch: one 5040-byte distance buffer + 10080-byte queue.
+ * Search scratch: 12 fixed 32-byte frames, with no recursive calls.
  * Concrete replay is checked here; full-state BFS/rank oracles are host-only.
  */
 enum {
@@ -288,51 +292,133 @@ static uint8_t heuristic(ranked_state_t state)
     return p > o ? p : o;
 }
 
-/* Return FOUND, or the minimum f that exceeded the current bound. */
-static int search(ranked_state_t state, int depth, int bound, uint8_t previous,
-                  solution_t *solution)
+/* Eight 32-bit fields per suspended node, independent of pointer width.
+ * Coordinates and cursors stay in locals while a node is active. Only an
+ * expanded child suspends its parent; cutoff/goal leaves need no frame writes.
+ */
+typedef struct {
+    uint32_t p, o;
+    uint32_t quarter_p, quarter_o;
+    uint32_t face, turn;
+    uint32_t previous, minimum;
+} search_frame_t;
+
+typedef char search_frame_must_be_32_bytes[
+    sizeof(search_frame_t) == 32 ? 1 : -1];
+
+/* Return FOUND, or the minimum f that exceeded the current bound.
+ * One loop generates children, enters expanded nodes and restores parents.
+ */
+static int search(ranked_state_t state, int bound, solution_t *solution)
 {
-    int f = depth + heuristic(state);
-    if (f > bound)
+    search_frame_t frames[MAX_DEPTH + 1];
+    int f = heuristic(state);
+    if (f > bound) {
+        MY_SOLVER_STACK_COUNT(bound_cutoffs);
         return f;
+    }
     if (state.p == 0 && state.o == 0) {
-        solution->length = (uint8_t) depth;
+        solution->length = 0;
         return FOUND;
     }
-    if (depth == MAX_DEPTH)
-        return INT_MAX;
+    uint32_t depth = 0, p = state.p, o = state.o;
+    uint32_t quarter_p = p, quarter_o = o;
+    uint32_t face = 0, turn = 0, previous = NONE, minimum = INT_MAX;
+    const uint16_t *perm_row = NULL, *ori_row = NULL;
 #ifdef MY_SOLVER_HOST_TEST
     ++solution->nodes;
 #endif
     MY_SOLVER_COUNT(expanded_nodes);
-    int minimum = INT_MAX;
-    for (uint8_t face = 0; face < 3; ++face) {
-        MY_SOLVER_COUNT(face_candidates);
-        /* Adjacent moves of one face combine into at most one HTM move. */
-        if (face == previous) {
-            MY_SOLVER_COUNT(same_face_pruned);
-            continue;
+    for (;;) {
+        if (turn == 3) {
+            ++face;
+            turn = 0;
         }
-        const uint16_t *perm_row = perm_transition[face];
-        const uint16_t *ori_row = ori_transition[face];
-        MY_SOLVER_COUNT(transition_row_pairs);
-        ranked_state_t next = state;
-        for (uint8_t turn = 0; turn < 3; ++turn) {
-            /* Reuse the preceding quarter turn for half/inverse children. */
-            next.p = perm_row[next.p];
-            MY_SOLVER_COUNT(perm_transition_lookups);
-            next.o = ori_row[next.o];
-            MY_SOLVER_COUNT(ori_transition_lookups);
-            MY_SOLVER_COUNT(generated_children);
-            solution->moves[depth] = (uint8_t) ((face << 1) + face + turn);
-            int result = search(next, depth + 1, bound, face, solution);
-            if (result == FOUND)
-                return FOUND;
+        if (face == 3) {
+            if (depth == 0)
+                return (int) minimum;
+            uint32_t result = minimum;
+            const search_frame_t *parent = &frames[--depth];
+            p = parent->p;
+            o = parent->o;
+            quarter_p = parent->quarter_p;
+            quarter_o = parent->quarter_o;
+            face = parent->face;
+            turn = parent->turn;
+            previous = parent->previous;
+            minimum = parent->minimum;
+            MY_SOLVER_STACK_COUNT(frame_pops);
             if (result < minimum)
                 minimum = result;
+            /* A completed face needs no row restoration: the next face
+             * obtains its rows normally on the next loop iteration.
+             */
+            if (turn < 3) {
+                perm_row = perm_transition[face];
+                ori_row = ori_transition[face];
+                MY_SOLVER_STACK_COUNT(restored_row_pairs);
+            }
+            continue;
         }
+        if (turn == 0) {
+            MY_SOLVER_COUNT(face_candidates);
+            /* Adjacent moves of one face combine into at most one HTM move. */
+            if (face == previous) {
+                MY_SOLVER_COUNT(same_face_pruned);
+                ++face;
+                continue;
+            }
+            perm_row = perm_transition[face];
+            ori_row = ori_transition[face];
+            MY_SOLVER_COUNT(transition_row_pairs);
+            quarter_p = p;
+            quarter_o = o;
+        }
+        quarter_p = perm_row[quarter_p];
+        MY_SOLVER_COUNT(perm_transition_lookups);
+        quarter_o = ori_row[quarter_o];
+        MY_SOLVER_COUNT(ori_transition_lookups);
+        MY_SOLVER_COUNT(generated_children);
+        solution->moves[depth] = (uint8_t) ((face << 1) + face + turn);
+        ++turn;
+        ranked_state_t next = {(uint16_t) quarter_p, (uint16_t) quarter_o};
+        f = (int) (depth + 1U) + heuristic(next);
+        if (f > bound) {
+            MY_SOLVER_STACK_COUNT(bound_cutoffs);
+            if ((uint32_t) f < minimum)
+                minimum = (uint32_t) f;
+            continue;
+        }
+        if (quarter_p == 0 && quarter_o == 0) {
+            solution->length = (uint8_t) (depth + 1U);
+            return FOUND;
+        }
+        if (depth + 1U == MAX_DEPTH) {
+            MY_SOLVER_STACK_COUNT(depth_limit_leaves);
+            continue;
+        }
+        search_frame_t *parent = &frames[depth];
+        parent->p = p;
+        parent->o = o;
+        parent->quarter_p = quarter_p;
+        parent->quarter_o = quarter_o;
+        parent->face = face;
+        parent->turn = turn;
+        parent->previous = previous;
+        parent->minimum = minimum;
+        MY_SOLVER_STACK_COUNT(frame_pushes);
+        ++depth;
+        p = quarter_p;
+        o = quarter_o;
+        previous = face;
+        face = 0;
+        turn = 0;
+        minimum = INT_MAX;
+#ifdef MY_SOLVER_HOST_TEST
+        ++solution->nodes;
+#endif
+        MY_SOLVER_COUNT(expanded_nodes);
     }
-    return minimum;
 }
 
 static int solve(ranked_state_t start, solution_t *solution)
@@ -341,7 +427,7 @@ static int solve(ranked_state_t start, solution_t *solution)
     int bound = heuristic(start);
     while (bound <= MAX_DEPTH) {
         MY_SOLVER_COUNT(iterations);
-        int result = search(start, 0, bound, NONE, solution);
+        int result = search(start, bound, solution);
         if (result == FOUND)
             return 1;
         if (result == INT_MAX)
