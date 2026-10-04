@@ -197,6 +197,23 @@ static int basic_search_test(void)
     return 1;
 }
 
+/* Keep the required distance-11 vector visible outside exhaustive H3. */
+static int distance_11_test(void)
+{
+    const char *input = "21345671111111";
+    state_t state;
+    solution_t solution;
+    if (!parse_state(input, &state)) {
+        fputs("distance-11 failed: could not parse 21345671111111\n", stderr);
+        return 0;
+    }
+    if (!check_search("distance-11", rank_state(&state), 11, &solution))
+        return 0;
+    printf("distance-11 passed: input=%s; expected=11; length=%u; replay=solved\n",
+           input, (unsigned) solution.length);
+    return 1;
+}
+
 /* Reference full-state BFS: never called by normal solving. */
 static uint8_t *build_oracle(void)
 {
@@ -382,7 +399,8 @@ static void report_memory(void)
 static void usage(FILE *output, const char *program)
 {
     fprintf(output, "usage: %s [--self-test | --h1 | --h2 | --h3 | --h4 | "
-                    "--random-test | --memory | --help]\n", program);
+                    "--random-test | --distance-11 | --memory | --help]\n",
+            program);
     fputs("No option runs --self-test. --h3 exhaustively solves all 3674160 states.\n",
           output);
 }
@@ -400,7 +418,8 @@ int main(int argc, char **argv)
         return output_failed();
     }
     static const char *const modes[] = {
-        "--self-test", "--h1", "--h2", "--h3", "--h4", "--random-test", "--memory"
+        "--self-test", "--h1", "--h2", "--h3", "--h4", "--random-test", "--memory",
+        "--distance-11"
     };
     int mode = -1;
     for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i)
@@ -418,7 +437,7 @@ int main(int argc, char **argv)
     }
     if (mode == 0) {
         if (!representation_test() || !h2_test(1) || !basic_search_test() ||
-            !h4_test()) {
+            !distance_11_test() || !h4_test()) {
             fputs("self-test failed\n", stderr);
             return 1;
         }
@@ -430,6 +449,8 @@ int main(int argc, char **argv)
         return h2_test(1) ? output_failed() : 1;
     if (mode == 4)
         return h4_test() ? output_failed() : 1;
+    if (mode == 7)
+        return distance_11_test() ? output_failed() : 1;
     if (mode == 6) {
         report_memory();
         return output_failed();
