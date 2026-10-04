@@ -9,6 +9,7 @@
  *   cc -O3 -std=c99 -Wall -Wextra -Wpedantic my_solver_test.c -o /tmp/my_solver_test
  *
  * Measurements (run one measurement at a time):
+ *   /tmp/my_solver_test --benchmark-initialization > /tmp/solver-setup.txt
  *   /tmp/my_solver_test --memory > /tmp/solver-memory.txt
  *   /tmp/my_solver_test --benchmark-11 > /tmp/solver-d11.txt
  *   /tmp/my_solver_test --benchmark-worst-11 > /tmp/solver-worst-d11.txt
@@ -20,7 +21,8 @@
  *   lscpu > /tmp/solver-cpu.txt
  *   sha256sum my_solver.c my_solver_test.c
  * Add -DMY_SOLVER_INSTRUMENT for direct operation counts, checked against
- * the exact loop model. Use the normal build for timings (no count hooks).
+ * the exact loop model. Normal host timings exclude detailed count hooks;
+ * the host node counter remains enabled and is absent from the normal core.
  *   cc -O3 -std=c99 -Wall -Wextra -Wpedantic -DMY_SOLVER_INSTRUMENT \
  *      my_solver_test.c -o /tmp/my_solver_test_counts
  * --benchmark-worst-11 checks the fixed worst case separately.
@@ -39,11 +41,27 @@ typedef struct {
     uint64_t ori_transition_lookups;
 } operation_counts_t;
 
+typedef struct {
+    uint64_t permutation_rank_calls;
+    uint64_t orientation_rank_calls;
+    uint64_t permutation_comparisons;
+    uint64_t orientation_rank_digits;
+    uint64_t permutation_successors;
+    uint64_t orientation_carry_digits;
+    uint64_t mod3_reductions;
+    uint64_t transition_writes;
+    uint64_t bfs_transition_lookups;
+    uint64_t packed_writes;
+} setup_counts_t;
+
 #ifdef MY_SOLVER_INSTRUMENT
+static setup_counts_t measured_setup;
+#define MY_SOLVER_SETUP_COUNT(field) (++measured_setup.field)
 static operation_counts_t measured_operations;
 #define MY_SOLVER_COUNT(field) (++measured_operations.field)
 #endif
 
+#define MY_SOLVER_HOST_TEST 1
 #define main my_solver_cli_main
 #include "my_solver.c"
 #undef main
@@ -51,11 +69,134 @@ static operation_counts_t measured_operations;
 static uint8_t hp[PERMUTATIONS], ho[ORIENTATIONS];
 static const uint8_t inverse_move[MOVES] = {2, 1, 0, 5, 4, 3, 8, 7, 6};
 
+enum { STATES = PERMUTATIONS * ORIENTATIONS };
+
+/* Full ranks and division-based decoding are retained only for host oracles. */
+static uint32_t rank_state(const state_t *state)
+{
+    uint32_t p = 0, o = 0;
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint8_t smaller = 0;
+        for (uint8_t j = (uint8_t) (i + 1U); j < CUBIES; ++j)
+            if (state->p[j] < state->p[i])
+                ++smaller;
+        p = p * (CUBIES - i) + smaller;
+    }
+    for (uint8_t i = 0; i < 6; ++i)
+        o = o * 3U + state->o[i];
+    return p * ORIENTATIONS + o;
+}
+
+static void unrank_state(uint32_t rank, state_t *state)
+{
+    uint8_t available[CUBIES] = {0, 1, 2, 3, 4, 5, 6};
+    uint32_t p = rank / ORIENTATIONS, o = rank % ORIENTATIONS, f = 720;
+    uint8_t sum = 0;
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint8_t q = (uint8_t) (p / f);
+        p %= f;
+        state->p[i] = available[q];
+        for (uint8_t j = q; j + 1U < (unsigned) CUBIES - i; ++j)
+            available[j] = available[j + 1U];
+        if (i < 5)
+            f /= 6U - i;
+    }
+    for (uint8_t i = 6; i-- > 0;) {
+        state->o[i] = (uint8_t) (o % 3U);
+        sum = (uint8_t) (sum + state->o[i]);
+        o /= 3U;
+    }
+    state->o[6] = (uint8_t) ((3U - sum % 3U) % 3U);
+}
+
+static state_t reference_quarter_turn(state_t state, uint8_t face)
+{
+    state_t result;
+    for (uint8_t i = 0; i < CUBIES; ++i) {
+        uint8_t from = source[face][i];
+        result.p[i] = state.p[from];
+        result.o[i] = (uint8_t) ((state.o[from] + twist[face][i]) % 3U);
+    }
+    return result;
+}
+
+static int build_reference_distances(uint16_t count,
+                                     uint16_t transition[3][count],
+                                     uint8_t *distance)
+{
+    uint16_t queue[PERMUTATIONS];
+    uint16_t head = 0, tail = 1;
+    memset(distance, UINT8_MAX, count);
+    queue[0] = 0;
+    distance[0] = 0;
+    while (head < tail) {
+        uint16_t here = queue[head++];
+        for (uint8_t face = 0; face < 3; ++face) {
+            uint16_t next = here;
+            for (uint8_t turn = 0; turn < 3; ++turn) {
+                next = transition[face][next];
+                if (distance[next] == UINT8_MAX) {
+                    distance[next] = (uint8_t) (distance[here] + 1U);
+                    queue[tail++] = next;
+                }
+            }
+        }
+    }
+    return tail == count;
+}
+
+/* Build the abstract tables independently with the original rank/unrank
+ * method, and compare every transition and packed distance byte.
+ */
+static int check_initialization_reference(int report)
+{
+    static uint16_t reference_perm[3][PERMUTATIONS];
+    static uint16_t reference_ori[3][ORIENTATIONS];
+    state_t state;
+    for (uint16_t p = 0; p < PERMUTATIONS; ++p) {
+        unrank_state((uint32_t) p * ORIENTATIONS, &state);
+        for (uint8_t face = 0; face < 3; ++face) {
+            state_t next = reference_quarter_turn(state, face);
+            reference_perm[face][p] = (uint16_t) (rank_state(&next) / ORIENTATIONS);
+        }
+    }
+    for (uint16_t o = 0; o < ORIENTATIONS; ++o) {
+        unrank_state(o, &state);
+        for (uint8_t face = 0; face < 3; ++face) {
+            state_t next = reference_quarter_turn(state, face);
+            reference_ori[face][o] = (uint16_t) (rank_state(&next) % ORIENTATIONS);
+        }
+    }
+    if (memcmp(reference_perm, perm_transition, sizeof reference_perm) ||
+        memcmp(reference_ori, ori_transition, sizeof reference_ori)) {
+        fputs("transition tables differ from independent initialization\n", stderr);
+        return 0;
+    }
+    if (!build_reference_distances(PERMUTATIONS, reference_perm, hp) ||
+        !build_reference_distances(ORIENTATIONS, reference_ori, ho))
+        return 0;
+    uint8_t expected_hp[(PERMUTATIONS + 1) / 2] = {0};
+    uint8_t expected_ho[(ORIENTATIONS + 1) / 2] = {0};
+    for (uint16_t i = 0; i < PERMUTATIONS; ++i)
+        expected_hp[i / 2U] |= (uint8_t) (hp[i] << ((i & 1U) * 4U));
+    for (uint16_t i = 0; i < ORIENTATIONS; ++i)
+        expected_ho[i / 2U] |= (uint8_t) (ho[i] << ((i & 1U) * 4U));
+    if (memcmp(expected_hp, hp_packed, sizeof expected_hp) ||
+        memcmp(expected_ho, ho_packed, sizeof expected_ho)) {
+        fputs("packed heuristic tables differ from independent initialization\n", stderr);
+        return 0;
+    }
+    if (report)
+        puts("initialization reference passed: all 17307 transitions and "
+             "2885 packed bytes match");
+    return 1;
+}
+
 static state_t apply_move(state_t state, uint8_t move)
 {
     uint8_t turns = (uint8_t) (move % 3U + 1U);
     for (uint8_t i = 0; i < turns; ++i)
-        state = quarter_turn(state, (uint8_t) (move / 3U));
+        state = reference_quarter_turn(state, (uint8_t) (move / 3U));
     return state;
 }
 
@@ -230,7 +371,7 @@ static int verify_solution(uint32_t rank, const solution_t *solution)
 {
     state_t state;
     unrank_state(rank, &state);
-    if (solution->length > MAX_DEPTH)
+    if (solution->length > MAX_DEPTH || !replay_solution(&state, solution))
         return 0;
     for (uint8_t i = 0; i < solution->length; ++i) {
         uint8_t move = solution->moves[i];
@@ -404,6 +545,68 @@ static double wall_seconds(void)
         return -1.0;
     }
     return (double) time.tv_sec + (double) time.tv_nsec / 1e9;
+}
+
+static int benchmark_initialization(void)
+{
+#ifdef MY_SOLVER_INSTRUMENT
+    memset(&measured_setup, 0, sizeof measured_setup);
+#endif
+    double before = wall_seconds();
+    if (before < 0 || !initialize_tables())
+        return 0;
+    double after = wall_seconds();
+    if (after < 0 || !check_initialization_reference(0))
+        return 0;
+    puts("benchmark=initialization\nclock=CLOCK_MONOTONIC\n"
+         "time_scope=initialize_tables_only\n"
+         "transition_tables_match_reference=true\n"
+         "packed_tables_match_reference=true\n"
+         "operation_count_scope=initialize_tables_only\n"
+         "machine_instruction_counts=false");
+    printf("initialization_wall_seconds=%.9f\n", after - before);
+#ifdef MY_SOLVER_INSTRUMENT
+    puts("time_includes_instrumentation=true\noperation_count_method=direct_hooks");
+    if (measured_setup.permutation_rank_calls != 15120 ||
+        measured_setup.orientation_rank_calls != 2187 ||
+        measured_setup.permutation_comparisons != 317520 ||
+        measured_setup.orientation_rank_digits != 13122 ||
+        measured_setup.permutation_successors != 5039 ||
+        measured_setup.orientation_carry_digits != 1086 ||
+        measured_setup.mod3_reductions != 15309 ||
+        measured_setup.transition_writes != 17307 ||
+        measured_setup.bfs_transition_lookups != 51921 ||
+        measured_setup.packed_writes != 5769) {
+        fputs("initialization operation counts differ from expected totals\n", stderr);
+        return 0;
+    }
+    printf("permutation_rank_calls=%" PRIu64 "\n",
+           measured_setup.permutation_rank_calls);
+    printf("orientation_rank_calls=%" PRIu64 "\n",
+           measured_setup.orientation_rank_calls);
+    printf("permutation_comparisons=%" PRIu64 "\n",
+           measured_setup.permutation_comparisons);
+    printf("orientation_rank_digits=%" PRIu64 "\n",
+           measured_setup.orientation_rank_digits);
+    printf("permutation_successors=%" PRIu64 "\n",
+           measured_setup.permutation_successors);
+    printf("orientation_carry_digits=%" PRIu64 "\n",
+           measured_setup.orientation_carry_digits);
+    printf("mod3_conditional_reductions=%" PRIu64 "\n",
+           measured_setup.mod3_reductions);
+    printf("transition_writes=%" PRIu64 "\n", measured_setup.transition_writes);
+    printf("bfs_transition_lookups=%" PRIu64 "\n",
+           measured_setup.bfs_transition_lookups);
+    printf("packed_writes=%" PRIu64 "\n", measured_setup.packed_writes);
+#else
+    puts("time_includes_instrumentation=false\n"
+         "operation_count_method=enable_MY_SOLVER_INSTRUMENT_for_direct_counts");
+#endif
+    puts("full_rank_calls=0\nunrank_calls=0\n"
+         "arithmetic_count_method=source_audit_explicit_runtime_operators\n"
+         "source_multiplies=0\nsource_divisions=0\nsource_modulos=0\n"
+         "initialization_scratch_bytes=15120\npersistent_table_bytes=37499");
+    return 1;
 }
 
 static int h3_test(const uint8_t *exact)
@@ -615,6 +818,42 @@ static int operation_counts_test(void)
     return 1;
 }
 
+static int input_and_replay_test(void)
+{
+    static const char *const invalid_inputs[] = {
+        "", "1234567111111", "123456711111111", "02345671111111",
+        "82345671111111", "12345671111110", "12345671111114",
+        "1234567111111a", "11345671111111", "12345671111112"
+    };
+    state_t state;
+    for (size_t i = 0; i < sizeof invalid_inputs / sizeof invalid_inputs[0]; ++i) {
+        if (parse_state(invalid_inputs[i], &state)) {
+            fprintf(stderr, "invalid input accepted: %s\n", invalid_inputs[i]);
+            return 0;
+        }
+    }
+    if (!parse_state("12345671111111", &state))
+        return 0;
+    solution_t solution = {0};
+    if (!replay_solution(&state, &solution))
+        return 0;
+    solution.length = MAX_DEPTH + 1;
+    if (replay_solution(&state, &solution))
+        return 0;
+    solution.length = 1;
+    solution.moves[0] = MOVES;
+    if (replay_solution(&state, &solution))
+        return 0;
+    solution.moves[0] = 0;
+    if (replay_solution(&state, &solution))
+        return 0;
+    if (!concrete_input_test())
+        return 0;
+    puts("input/replay passed: malformed inputs, invalid moves, length bound, "
+         "incorrect path, three concrete input cases");
+    return 1;
+}
+
 static void report_operations(const operation_counts_t *counts)
 {
     puts("operation_count_scope=source_level_logical_solve_operations");
@@ -666,10 +905,11 @@ static int benchmark_11(const char *input, const char *name)
     printf("benchmark=%s\n", name);
     puts("solve_time_scope=solve_only\nclock=CLOCK_MONOTONIC");
 #ifdef MY_SOLVER_INSTRUMENT
-    puts("solve_time_includes_instrumentation=true");
+    puts("solve_time_includes_operation_hooks=true");
 #else
-    puts("solve_time_includes_instrumentation=false");
+    puts("solve_time_includes_operation_hooks=false");
 #endif
+    puts("solve_time_includes_host_node_counter=true");
     printf("input=%s\nrank=%" PRIu32 "\nsolution_length=%u\n",
            input, rank, (unsigned) solution.length);
     printf("solve_wall_seconds=%.9f\n", after - before);
@@ -753,11 +993,12 @@ static int benchmark_all_d11(const uint8_t *exact)
          "solve_time_scope=sum_of_solve_only_intervals\n"
          "set_time_scope=scan_search_and_host_validation_excludes_bfs");
 #ifdef MY_SOLVER_INSTRUMENT
-    puts("solve_time_includes_instrumentation=true\n"
+    puts("solve_time_includes_operation_hooks=true\n"
          "operation_count_hooks_match_model_all=true");
 #else
-    puts("solve_time_includes_instrumentation=false");
+    puts("solve_time_includes_operation_hooks=false");
 #endif
+    puts("solve_time_includes_host_node_counter=true");
     printf("distance_11_states=%" PRIu32 "\nstates_tested=%" PRIu32 "\n",
            count, tested);
     printf("total_expanded_nodes=%" PRIu64 "\n", total);
@@ -776,7 +1017,8 @@ static void report_memory(void)
 {
     size_t tables = sizeof perm_transition + sizeof ori_transition +
                     sizeof hp_packed + sizeof ho_packed;
-    size_t other_arrays = sizeof move_names + sizeof source + sizeof twist;
+    size_t other_arrays = sizeof move_names + sizeof source + sizeof twist +
+                          sizeof validation_cases;
     size_t name_strings = 0;
     for (uint8_t move = 0; move < MOVES; ++move)
         name_strings += (strlen(move_names[move]) + 1U) * sizeof(char);
@@ -792,6 +1034,8 @@ static void report_memory(void)
            sizeof move_names);
     printf("persistent_solver_data.source_bytes=%zu\n", sizeof source);
     printf("persistent_solver_data.twist_bytes=%zu\n", sizeof twist);
+    printf("persistent_solver_data.validation_case_bytes=%zu\n",
+           sizeof validation_cases);
     printf("persistent_solver_data.other_named_arrays_bytes=%zu\n", other_arrays);
     printf("persistent_solver_data.total_named_arrays_bytes=%zu\n",
            tables + other_arrays);
@@ -801,22 +1045,22 @@ static void report_memory(void)
     printf("persistent_solver_data.move_name_string_bytes=%zu\n", name_strings);
     printf("persistent_solver_data.arrays_and_move_strings_bytes=%zu\n",
            tables + other_arrays + name_strings);
-    printf("initialization_only_scratch.hp_bytes=%zu\n",
+    printf("initialization_only_scratch.distance_bytes=%zu\n",
            sizeof(uint8_t[PERMUTATIONS]));
-    printf("initialization_only_scratch.ho_bytes=%zu\n",
-           sizeof(uint8_t[ORIENTATIONS]));
     printf("initialization_only_scratch.queue_bytes=%zu\n",
            sizeof(uint16_t[PERMUTATIONS]));
     printf("initialization_only_scratch.total_bytes=%zu\n",
-           sizeof(uint8_t[PERMUTATIONS]) + sizeof(uint8_t[ORIENTATIONS]) +
-           sizeof(uint16_t[PERMUTATIONS]));
+           sizeof(uint8_t[PERMUTATIONS]) + sizeof(uint16_t[PERMUTATIONS]));
     printf("search_path_storage.moves_bytes=%zu\n",
            sizeof(((solution_t *) 0)->moves));
     printf("search_path_storage.length_bytes=%zu\n",
            sizeof(((solution_t *) 0)->length));
-    printf("search_path_storage.node_counter_bytes=%zu\n",
+    puts("search_path_storage.node_counter_bytes=0");
+    printf("search_path_storage.context_bytes=%zu\n",
+           sizeof(uint8_t[MAX_DEPTH]) + sizeof(uint8_t));
+    printf("host_search_statistics.node_counter_bytes=%zu\n",
            sizeof(((solution_t *) 0)->nodes));
-    printf("search_path_storage.context_bytes=%zu\n", sizeof(solution_t));
+    printf("host_search_statistics.context_bytes=%zu\n", sizeof(solution_t));
     printf("search_path_storage.max_recursive_frames=%u\n", MAX_DEPTH + 1);
     puts("search_path_storage.call_frame_bytes=compiler_dependent\n"
          "host_bfs_oracle_in_target_memory=false\n"
@@ -828,7 +1072,8 @@ static void usage(FILE *output, const char *program)
     fprintf(output, "usage: %s [--self-test | --h1 | --h2 | --h3 | --h4 | "
                     "--random-test | --distance-11 | --memory | "
                     "--benchmark-11 | --benchmark-all-d11 | "
-                    "--benchmark-worst-11 | --help]\n",
+                    "--benchmark-worst-11 | --benchmark-initialization | "
+                    "--help]\n",
             program);
     fputs("No option runs --self-test. --h3 exhaustively solves all 3674160 states.\n",
           output);
@@ -848,7 +1093,8 @@ int main(int argc, char **argv)
     }
     static const char *const modes[] = {
         "--self-test", "--h1", "--h2", "--h3", "--h4", "--random-test", "--memory",
-        "--distance-11", "--benchmark-11", "--benchmark-all-d11", "--benchmark-worst-11"
+        "--distance-11", "--benchmark-11", "--benchmark-all-d11", "--benchmark-worst-11",
+        "--benchmark-initialization"
     };
     int mode = -1;
     for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i)
@@ -858,15 +1104,16 @@ int main(int argc, char **argv)
         usage(stderr, program);
         return 2;
     }
-    if (!initialize_tables() ||
-        !build_distances(PERMUTATIONS, perm_transition, hp) ||
-        !build_distances(ORIENTATIONS, ori_transition, ho)) {
+    if (mode == 11)
+        return benchmark_initialization() ? output_failed() : 1;
+    if (!initialize_tables() || !check_initialization_reference(mode <= 4)) {
         fputs("could not build complete abstraction tables\n", stderr);
         return 1;
     }
     if (mode == 0) {
         if (!representation_test() || !h2_test(1) || !basic_search_test() ||
-            !distance_11_test() || !h4_test() || !operation_counts_test()) {
+            !distance_11_test() || !h4_test() || !operation_counts_test() ||
+            !input_and_replay_test()) {
             fputs("self-test failed\n", stderr);
             return 1;
         }
