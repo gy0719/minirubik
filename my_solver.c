@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Host tests may count logical operations; normal builds emit no hooks. */
+#ifndef MY_SOLVER_COUNT
+#define MY_SOLVER_COUNT(field) ((void) 0)
+#endif
+
 /* Optimal HTM IDA*: R/B/D generators, max(hp,ho), same-face pruning.
  * Persistent tables: 30240 + 4374 + 2520 + 365 = 37499 bytes.
  * Initialization scratch: 5769 distance bytes and a 10080-byte queue.
@@ -140,16 +145,6 @@ static void build_transitions(void)
     }
 }
 
-static ranked_state_t apply_ranked_move(ranked_state_t state, uint8_t move)
-{
-    uint8_t face = (uint8_t) (move / 3U);
-    for (uint8_t turn = 0; turn <= move % 3U; ++turn) {
-        state.p = perm_transition[face][state.p];
-        state.o = ori_transition[face][state.o];
-    }
-    return state;
-}
-
 /* BFS from zero gives exact abstract HTM distances. */
 static int build_distances(uint16_t count, uint16_t transition[3][count],
                            uint8_t *distance)
@@ -223,6 +218,7 @@ typedef struct {
 
 static uint8_t heuristic(ranked_state_t state)
 {
+    MY_SOLVER_COUNT(heuristic_calls);
     uint8_t p = packed_get(hp_packed, state.p);
     uint8_t o = packed_get(ho_packed, state.o);
     /* Both abstractions charge for the same moves: use max, never sum. */
@@ -243,19 +239,33 @@ static int search(ranked_state_t state, int depth, int bound, uint8_t previous,
     if (depth == MAX_DEPTH)
         return INT_MAX;
     ++solution->nodes;
+    MY_SOLVER_COUNT(expanded_nodes);
     int minimum = INT_MAX;
-    for (uint8_t move = 0; move < MOVES; ++move) {
-        uint8_t face = (uint8_t) (move / 3U);
+    for (uint8_t face = 0; face < 3; ++face) {
+        MY_SOLVER_COUNT(face_candidates);
         /* Adjacent moves of one face combine into at most one HTM move. */
-        if (face == previous)
+        if (face == previous) {
+            MY_SOLVER_COUNT(same_face_pruned);
             continue;
-        solution->moves[depth] = move;
-        int result = search(apply_ranked_move(state, move), depth + 1,
-                            bound, face, solution);
-        if (result == FOUND)
-            return FOUND;
-        if (result < minimum)
-            minimum = result;
+        }
+        const uint16_t *perm_row = perm_transition[face];
+        const uint16_t *ori_row = ori_transition[face];
+        MY_SOLVER_COUNT(transition_row_pairs);
+        ranked_state_t next = state;
+        for (uint8_t turn = 0; turn < 3; ++turn) {
+            /* Reuse the preceding quarter turn for half/inverse children. */
+            next.p = perm_row[next.p];
+            MY_SOLVER_COUNT(perm_transition_lookups);
+            next.o = ori_row[next.o];
+            MY_SOLVER_COUNT(ori_transition_lookups);
+            MY_SOLVER_COUNT(generated_children);
+            solution->moves[depth] = (uint8_t) ((face << 1) + face + turn);
+            int result = search(next, depth + 1, bound, face, solution);
+            if (result == FOUND)
+                return FOUND;
+            if (result < minimum)
+                minimum = result;
+        }
     }
     return minimum;
 }
@@ -265,6 +275,7 @@ static int solve(ranked_state_t start, solution_t *solution)
     memset(solution, 0, sizeof *solution);
     int bound = heuristic(start);
     while (bound <= MAX_DEPTH) {
+        MY_SOLVER_COUNT(iterations);
         int result = search(start, 0, bound, NONE, solution);
         if (result == FOUND)
             return 1;
