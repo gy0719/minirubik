@@ -3,3 +3,6 @@
 *.swp
 solver
 mini
+/solver_tables.o
+/solver.o
+/solver.elf
