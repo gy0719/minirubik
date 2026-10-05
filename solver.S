@@ -2,6 +2,9 @@
 .option norvc
 .option norelax
 
+#ifndef SOLVER_CUBE_INPUT
+#define SOLVER_CUBE_INPUT "54721631111111"
+#endif
 
 /* ============================================================
  * Read-only data
@@ -12,7 +15,7 @@
 .globl cube_input
 .type cube_input, @object
 cube_input:
-    .ascii "54721631111111"
+    .ascii SOLVER_CUBE_INPUT
 cube_input_end:
     .byte 0
 .size cube_input, . - cube_input
