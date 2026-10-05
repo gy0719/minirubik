@@ -225,6 +225,7 @@ rank_orientation:
  *   t6 holds search's return PC; a3 holds heuristic's return PC.
  *   Helpers preserve a4/a5/a6/t6 and all s registers.
  *   search uses s0..s11 for its active node and cached transition rows.
+ *   search caches hp_table/ho_table in t3/t4, preserved by its helpers.
  * These routines are internal to this bare-metal program, not C ABI entry
  * points. The only search stack is the existing 384-byte search_frames.
  * ============================================================ */
@@ -302,7 +303,7 @@ quarter_transition:
  * Active node:
  *   s0 depth; s1 p; s2 o; s3 quarter_p; s4 quarter_o;
  *   s5 face; s6 turn; s7 previous; s8 minimum; s9 bound;
- *   s10 permutation row; s11 orientation row.
+ *   s10 permutation row; s11 orientation row; t3 hp base; t4 ho base.
  */
 .type search, @function
 search:
@@ -314,6 +315,10 @@ search:
     bltu    s9, a0, .Lsearch_return
     or      t0, s1, s2
     beqz    t0, .Lsearch_root_goal
+
+    /* Cache packed table bases once per expanded search root. */
+    la      t3, hp_table
+    la      t4, ho_table
 
     li      s0, 0
     mv      s3, s1
@@ -390,7 +395,26 @@ search:
     sb      t0, 0(t1)
     addi    s6, s6, 1
 
-    jal     ra, heuristic
+    /* Inline the child heuristic; cold root/solve calls keep the helper.
+     * Preserve its nibble convention and max comparison exactly.
+     */
+    srli    t0, s3, 1
+    add     t0, t3, t0
+    lbu     t2, 0(t0)
+    andi    t1, s3, 1
+    slli    t1, t1, 2
+    srl     t2, t2, t1
+    andi    t2, t2, 15
+    srli    t0, s4, 1
+    add     t0, t4, t0
+    lbu     a0, 0(t0)
+    andi    t1, s4, 1
+    slli    t1, t1, 2
+    srl     a0, a0, t1
+    andi    a0, a0, 15
+    bgeu    a0, t2, .Lsearch_child_heuristic_done
+    mv      a0, t2
+.Lsearch_child_heuristic_done:
     addi    t0, s0, 1
     add     t0, t0, a0
     bltu    s9, t0, .Lsearch_cutoff
