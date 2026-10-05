@@ -228,7 +228,7 @@ rank_orientation:
  *   search caches hp_table/ho_table in t3/t4, preserved by its helpers.
  *   After its cold root heuristic, search caches transition bases in a2/a3.
  *   t5 is the explicit-frame cursor: search_frames + 32 * active depth.
- *   a7 caches solution_path while search's inner loop runs.
+ *   a7 points to solution_path + active depth, updated only on push/pop.
  *   After the cold root call, ra holds 3; the return PC remains in t6.
  *   a1 holds the maximum depth 11 until search returns.
  * These routines are internal to this bare-metal program, not C ABI entry
@@ -329,7 +329,7 @@ quarter_transition:
  *   s10 permutation row; s11 orientation row; t3 hp base; t4 ho base.
  *   a2 permutation table base; a3 orientation table base.
  *   t5 points to the current depth's frame slot, updated only on push/pop.
- *   a7 is the solution_path base.
+ *   a7 points to the current depth's solution_path byte.
  *   ra is the constant 3; there are no calls in the inner search loop.
  *   a1 is the constant maximum depth 11.
  */
@@ -366,6 +366,7 @@ search:
 
 .Lsearch_loop:
     bne     s6, ra, .Lsearch_face
+.Lsearch_advance_face:
     addi    s5, s5, 1
     li      s6, 0
 .Lsearch_face:
@@ -376,6 +377,7 @@ search:
     mv      t0, s8
     addi    s0, s0, -1
     addi    t5, t5, -32
+    addi    a7, a7, -1
     lw      s1, 0(t5)
     lw      s2, 4(t5)
     lw      s3, 8(t5)
@@ -387,10 +389,11 @@ search:
     bgeu    t0, s8, .Lsearch_restored
     mv      s8, t0
 .Lsearch_restored:
-    bgeu    s6, ra, .Lsearch_loop
+    /* A saved turn is 1..3: resume directly without root-loop checks. */
+    bgeu    s6, ra, .Lsearch_advance_face
     /* A completed face does not need its row pointers restored. */
     search_transition_rows
-    j       .Lsearch_loop
+    j       .Lsearch_generate
 
 .Lsearch_next_face:
     bnez    s6, .Lsearch_generate
@@ -414,8 +417,7 @@ search:
     slli    t0, s5, 1
     add     t0, t0, s5
     add     t0, t0, s6
-    add     t1, a7, s0
-    sb      t0, 0(t1)
+    sb      t0, 0(a7)
     addi    s6, s6, 1
 
     /* Inline the child heuristic; cold root/solve calls keep the helper.
@@ -438,12 +440,12 @@ search:
     bgeu    a0, t2, .Lsearch_child_heuristic_done
     mv      a0, t2
 .Lsearch_child_heuristic_done:
+    /* Keep child depth in t0; a0 holds f until cutoff handling finishes. */
     addi    t0, s0, 1
-    add     t0, t0, a0
-    bltu    s9, t0, .Lsearch_cutoff
-    or      t0, s3, s4
-    beqz    t0, .Lsearch_child_goal
-    addi    t0, s0, 1
+    add     a0, t0, a0
+    bltu    s9, a0, .Lsearch_cutoff
+    or      t1, s3, s4
+    beqz    t1, .Lsearch_child_goal
     beq     t0, a1, .Lsearch_loop
 
     /* Only an expanded child suspends its parent. Frame layout:
@@ -460,6 +462,7 @@ search:
     sw      s8, 28(t5)
     addi    t5, t5, 32
     addi    s0, s0, 1
+    addi    a7, a7, 1
     mv      s1, s3
     mv      s2, s4
     mv      s7, s5
@@ -469,8 +472,8 @@ search:
     j       .Lsearch_loop
 
 .Lsearch_cutoff:
-    bgeu    t0, s8, .Lsearch_loop
-    mv      s8, t0
+    bgeu    a0, s8, .Lsearch_loop
+    mv      s8, a0
     j       .Lsearch_loop
 .Lsearch_child_goal:
     la      t0, solution_length
