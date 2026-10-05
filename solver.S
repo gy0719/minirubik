@@ -227,6 +227,10 @@ rank_orientation:
  *   search uses s0..s11 for its active node and cached transition rows.
  *   search caches hp_table/ho_table in t3/t4, preserved by its helpers.
  *   After its cold root heuristic, search caches transition bases in a2/a3.
+ *   t5 is the explicit-frame cursor: search_frames + 32 * active depth.
+ *   a7 caches solution_path while search's inner loop runs.
+ *   After the cold root call, ra holds 3; the return PC remains in t6.
+ *   a1 holds the maximum depth 11 until search returns.
  * These routines are internal to this bare-metal program, not C ABI entry
  * points. The only search stack is the existing 384-byte search_frames.
  * ============================================================ */
@@ -324,6 +328,10 @@ quarter_transition:
  *   s5 face; s6 turn; s7 previous; s8 minimum; s9 bound;
  *   s10 permutation row; s11 orientation row; t3 hp base; t4 ho base.
  *   a2 permutation table base; a3 orientation table base.
+ *   t5 points to the current depth's frame slot, updated only on push/pop.
+ *   a7 is the solution_path base.
+ *   ra is the constant 3; there are no calls in the inner search loop.
+ *   a1 is the constant maximum depth 11.
  */
 .type search, @function
 search:
@@ -341,6 +349,10 @@ search:
     la      t4, ho_table
     la      a2, perm_move_table
     la      a3, ori_move_table
+    la      t5, search_frames
+    la      a7, solution_path
+    li      ra, 3
+    li      a1, 11
 
     li      s0, 0
     mv      s3, s1
@@ -353,34 +365,29 @@ search:
     li      s11, 0
 
 .Lsearch_loop:
-    li      t0, 3
-    bne     s6, t0, .Lsearch_face
+    bne     s6, ra, .Lsearch_face
     addi    s5, s5, 1
     li      s6, 0
 .Lsearch_face:
-    li      t0, 3
-    bne     s5, t0, .Lsearch_next_face
+    bne     s5, ra, .Lsearch_next_face
     beqz    s0, .Lsearch_exhausted
 
     /* Return an exhausted child's minimum to its suspended parent. */
     mv      t0, s8
     addi    s0, s0, -1
-    slli    t1, s0, 5
-    la      t2, search_frames
-    add     t1, t1, t2
-    lw      s1, 0(t1)
-    lw      s2, 4(t1)
-    lw      s3, 8(t1)
-    lw      s4, 12(t1)
-    lw      s5, 16(t1)
-    lw      s6, 20(t1)
-    lw      s7, 24(t1)
-    lw      s8, 28(t1)
+    addi    t5, t5, -32
+    lw      s1, 0(t5)
+    lw      s2, 4(t5)
+    lw      s3, 8(t5)
+    lw      s4, 12(t5)
+    lw      s5, 16(t5)
+    lw      s6, 20(t5)
+    lw      s7, 24(t5)
+    lw      s8, 28(t5)
     bgeu    t0, s8, .Lsearch_restored
     mv      s8, t0
 .Lsearch_restored:
-    li      t0, 3
-    bgeu    s6, t0, .Lsearch_loop
+    bgeu    s6, ra, .Lsearch_loop
     /* A completed face does not need its row pointers restored. */
     search_transition_rows
     j       .Lsearch_loop
@@ -407,8 +414,7 @@ search:
     slli    t0, s5, 1
     add     t0, t0, s5
     add     t0, t0, s6
-    la      t1, solution_path
-    add     t1, t1, s0
+    add     t1, a7, s0
     sb      t0, 0(t1)
     addi    s6, s6, 1
 
@@ -438,24 +444,21 @@ search:
     or      t0, s3, s4
     beqz    t0, .Lsearch_child_goal
     addi    t0, s0, 1
-    li      t1, 11
-    beq     t0, t1, .Lsearch_loop
+    beq     t0, a1, .Lsearch_loop
 
     /* Only an expanded child suspends its parent. Frame layout:
      * +0 p, +4 o, +8 quarter_p, +12 quarter_o, +16 face,
      * +20 turn, +24 previous, +28 minimum; stride = 32 bytes.
      */
-    slli    t0, s0, 5
-    la      t1, search_frames
-    add     t0, t0, t1
-    sw      s1, 0(t0)
-    sw      s2, 4(t0)
-    sw      s3, 8(t0)
-    sw      s4, 12(t0)
-    sw      s5, 16(t0)
-    sw      s6, 20(t0)
-    sw      s7, 24(t0)
-    sw      s8, 28(t0)
+    sw      s1, 0(t5)
+    sw      s2, 4(t5)
+    sw      s3, 8(t5)
+    sw      s4, 12(t5)
+    sw      s5, 16(t5)
+    sw      s6, 20(t5)
+    sw      s7, 24(t5)
+    sw      s8, 28(t5)
+    addi    t5, t5, 32
     addi    s0, s0, 1
     mv      s1, s3
     mv      s2, s4
