@@ -226,6 +226,7 @@ rank_orientation:
  *   Helpers preserve a4/a5/a6/t6 and all s registers.
  *   search uses s0..s11 for its active node and cached transition rows.
  *   search caches hp_table/ho_table in t3/t4, preserved by its helpers.
+ *   After its cold root heuristic, search caches transition bases in a2/a3.
  * These routines are internal to this bare-metal program, not C ABI entry
  * points. The only search stack is the existing 384-byte search_frames.
  * ============================================================ */
@@ -298,12 +299,31 @@ quarter_transition:
     ret
 .size quarter_transition, . - quarter_transition
 
+/* Inline row selection at both search sites. The fixed face-major layout
+ * stays unchanged; a2/a3 contain the cached permutation/orientation bases.
+ * Macro expansion adds no calls, stack traffic, or new lookup tables.
+ */
+.macro search_transition_rows
+    mv      s10, a2
+    mv      s11, a3
+    beqz    s5, .Lsearch_rows_done\@
+    li      t1, 10080
+    add     s10, s10, t1
+    addi    s11, s11, 1458
+    li      t2, 1
+    beq     s5, t2, .Lsearch_rows_done\@
+    add     s10, s10, t1
+    addi    s11, s11, 1458
+.Lsearch_rows_done\@:
+.endm
+
 /* a0 = root p, a1 = root o, a2 = bound.
  * Return a0 = -1 (FOUND), or the minimum exceeded f / INT_MAX.
  * Active node:
  *   s0 depth; s1 p; s2 o; s3 quarter_p; s4 quarter_o;
  *   s5 face; s6 turn; s7 previous; s8 minimum; s9 bound;
  *   s10 permutation row; s11 orientation row; t3 hp base; t4 ho base.
+ *   a2 permutation table base; a3 orientation table base.
  */
 .type search, @function
 search:
@@ -319,6 +339,8 @@ search:
     /* Cache packed table bases once per expanded search root. */
     la      t3, hp_table
     la      t4, ho_table
+    la      a2, perm_move_table
+    la      a3, ori_move_table
 
     li      s0, 0
     mv      s3, s1
@@ -360,10 +382,7 @@ search:
     li      t0, 3
     bgeu    s6, t0, .Lsearch_loop
     /* A completed face does not need its row pointers restored. */
-    mv      a0, s5
-    jal     ra, transition_rows
-    mv      s10, a0
-    mv      s11, a1
+    search_transition_rows
     j       .Lsearch_loop
 
 .Lsearch_next_face:
@@ -373,20 +392,18 @@ search:
     addi    s5, s5, 1
     j       .Lsearch_loop
 .Lsearch_select_rows:
-    mv      a0, s5
-    jal     ra, transition_rows
-    mv      s10, a0
-    mv      s11, a1
+    search_transition_rows
     mv      s3, s1
     mv      s4, s2
 
 .Lsearch_generate:
     /* Reuse the preceding quarter turn for half/inverse children. */
-    mv      a0, s3
-    mv      a1, s4
-    jal     ra, quarter_transition
-    mv      s3, a0
-    mv      s4, a1
+    slli    t0, s3, 1
+    add     t0, s10, t0
+    lhu     s3, 0(t0)
+    slli    t0, s4, 1
+    add     t0, s11, t0
+    lhu     s4, 0(t0)
     slli    t0, s5, 1
     add     t0, t0, s5
     add     t0, t0, s6
