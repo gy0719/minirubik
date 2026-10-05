@@ -1,7 +1,11 @@
 #include <limits.h>
 #include <stdint.h>
+#ifdef RV32_TARGET
+#include <stddef.h>
+#else
 #include <stdio.h>
 #include <string.h>
+#endif
 
 /* Host tests may count logical operations; normal builds emit no hooks. */
 #ifndef MY_SOLVER_COUNT
@@ -40,6 +44,23 @@ typedef struct {
 } ranked_state_t;
 
 /* Only quarter turns are stored; half/inverse turns repeat lookups. */
+#ifdef RV32_TARGET
+extern const uint16_t perm_move_table[3][PERMUTATIONS];
+extern const uint16_t ori_move_table[3][ORIENTATIONS];
+extern const uint8_t hp_table[(PERMUTATIONS + 1) >> 1];
+extern const uint8_t ho_table[(ORIENTATIONS + 1) >> 1];
+/* Pointer views keep the existing row-selection expressions and avoid
+ * multiplying a variable face by a large byte stride on RV32I.
+ */
+static const uint16_t *const perm_transition[3] = {
+    perm_move_table[0], perm_move_table[1], perm_move_table[2]
+};
+static const uint16_t *const ori_transition[3] = {
+    ori_move_table[0], ori_move_table[1], ori_move_table[2]
+};
+#define hp_packed hp_table
+#define ho_packed ho_table
+#else
 static uint16_t perm_transition[3][PERMUTATIONS];
 static uint16_t ori_transition[3][ORIENTATIONS];
 static uint8_t hp_packed[(PERMUTATIONS + 1) >> 1];
@@ -48,6 +69,7 @@ static uint8_t ho_packed[(ORIENTATIONS + 1) >> 1];
 static const char *const move_names[MOVES] = {
     "R", "R2", "R'", "B", "B2", "B'", "D", "D2", "D'"
 };
+#endif
 /* Each destination takes a cubie from source[face][destination]. */
 static const uint8_t source[3][CUBIES] = {
     {1, 4, 2, 0, 3, 5, 6},
@@ -113,6 +135,7 @@ static uint16_t rank_orientation(const uint8_t orientation[CUBIES])
 }
 
 /* Advance to the next lexicographic rank; the caller skips the last rank. */
+#ifndef RV32_TARGET
 static void next_permutation(uint8_t permutation[CUBIES])
 {
     MY_SOLVER_SETUP_COUNT(permutation_successors);
@@ -146,6 +169,7 @@ static void next_orientation(uint8_t orientation[CUBIES])
         orientation[i] = 0;
     }
 }
+#endif
 
 static int valid(const state_t *state)
 {
@@ -168,6 +192,7 @@ static ranked_state_t rank_coordinates(const state_t *state)
     return coordinates;
 }
 
+#ifndef RV32_TARGET
 static void build_transitions(void)
 {
     state_t state = {{0, 1, 2, 3, 4, 5, 6}, {0}};
@@ -226,6 +251,7 @@ static int build_distances(uint16_t count, const uint16_t *const rows[3],
     }
     return tail == count;
 }
+#endif
 
 /* Even indices use the low nibble; odd indices use the high nibble. */
 static uint8_t packed_get(const uint8_t *table, uint16_t index)
@@ -234,6 +260,7 @@ static uint8_t packed_get(const uint8_t *table, uint16_t index)
     return (uint8_t) ((table[index >> 1] >> shift) & 0xFU);
 }
 
+#ifndef RV32_TARGET
 static void packed_set(uint8_t *table, uint16_t index, uint8_t value)
 {
     unsigned shift = (index & 1U) << 2;
@@ -274,6 +301,7 @@ static int initialize_tables(void)
            build_distances(ORIENTATIONS, ori_rows, distance, queue) &&
            pack_distances(distance, ho_packed, ORIENTATIONS);
 }
+#endif
 
 typedef struct {
     uint8_t moves[MAX_DEPTH];
@@ -423,7 +451,13 @@ static int search(ranked_state_t state, int bound, solution_t *solution)
 
 static int solve(ranked_state_t start, solution_t *solution)
 {
+#ifdef RV32_TARGET
+    /* Same zero initialization, without requiring a target C library. */
+    for (size_t i = 0; i < sizeof *solution; ++i)
+        ((unsigned char *) solution)[i] = 0;
+#else
     memset(solution, 0, sizeof *solution);
+#endif
     int bound = heuristic(start);
     while (bound <= MAX_DEPTH) {
         MY_SOLVER_COUNT(iterations);
@@ -481,6 +515,7 @@ static int replay_solution(const state_t *original, const solution_t *solution)
     return 1;
 }
 
+#ifndef RV32_TARGET
 static const struct {
     char input[15];
     uint8_t length;
@@ -542,3 +577,45 @@ int main(int argc, char **argv)
     putchar('\n');
     return output_failed();
 }
+#else
+/* Override the literal with -DRV32_CUBE_INPUT='"..."' for another input. */
+#ifndef RV32_CUBE_INPUT
+#define RV32_CUBE_INPUT "54721631111111"
+#endif
+_Static_assert(sizeof(RV32_CUBE_INPUT) == 15,
+               "RV32_CUBE_INPUT must contain exactly 14 characters");
+const char cube_input[15] = RV32_CUBE_INPUT;
+solution_t target_solution;
+volatile uint32_t solution_length;
+volatile uint32_t validation_result;
+
+/* Supply the C ABI stack without a runtime library or simulator SP preset.
+ * The fixed IDA* frames and concrete replay locals use this static storage.
+ */
+static uint8_t target_stack[2048] __attribute__((used, aligned(16)));
+
+static void target_main(void) __attribute__((used, noinline, noreturn));
+static void target_main(void)
+{
+    state_t state;
+    solution_length = 0;
+    validation_result = 0;
+    if (parse_state(cube_input, &state) &&
+        solve(rank_coordinates(&state), &target_solution)) {
+        solution_length = target_solution.length;
+        validation_result = (uint32_t) replay_solution(&state, &target_solution);
+    }
+    __asm__ volatile ("li a7, 10\n\tecall" ::: "a7", "memory");
+    __builtin_unreachable();
+}
+
+void _start(void) __attribute__((naked, noreturn));
+void _start(void)
+{
+    __asm__ volatile (".option push\n\t"
+                      ".option norelax\n\t"
+                      "la sp, target_stack + 2048\n\t"
+                      "call target_main\n\t"
+                      ".option pop");
+}
+#endif
