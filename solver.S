@@ -1,9 +1,18 @@
+/* GNU builds default to the frozen CLI program. GUI builds use
+ * -DSOLVER_RENDER=1 and link LED_MATRIX_0_BASE/WIDTH/HEIGHT from the
+ * actual Ripes I/O symbol panel (--defsym); no MMIO address is baked in.
+ * Load that ELF in Ripes: its native assembler does not support the GNU
+ * macros/directives already used by this source. */
+#ifdef SOLVER_RENDER
+.equ RENDER, SOLVER_RENDER
+#else
 .equ RENDER, 0
+#endif
 .option norvc
 .option norelax
 
 #ifndef SOLVER_CUBE_INPUT
-#define SOLVER_CUBE_INPUT "54721631111111"
+#define SOLVER_CUBE_INPUT "21345671111111"
 #endif
 
 /* ============================================================
@@ -72,6 +81,29 @@ validation_result:
 search_frames:
     .space 384
 .size search_frames, . - search_frames
+
+.if RENDER
+/* Same zero-based p[7], o[7] as my_solver.c; corner 0 is implicit/fixed. */
+.type render_cube, @object
+render_cube:
+    .space 14
+.size render_cube, . - render_cube
+.type render_next, @object
+render_next:
+    .space 14
+.size render_next, . - render_next
+.balign 4
+.globl render_moves
+.type render_moves, @object
+render_moves:
+    .space 4
+.size render_moves, . - render_moves
+.globl render_validation_result
+.type render_validation_result, @object
+render_validation_result:
+    .space 4
+.size render_validation_result, . - render_validation_result
+.endif
 
 
 /* ============================================================
@@ -649,9 +681,293 @@ _start:
     lw      a1, 0(t0)
     jal     ra, replay_solution
 
+.if RENDER
+    /* Search and ranked replay are complete before any LED writes. */
+    beqz    a0, .Lprogram_exit
+    jal     ra, render_solution
+.endif
+
 /* Stop Ripes after solving so CLI instruction measurement terminates. */
 .Lprogram_exit:
     li      a7, 10
     ecall
 
 .size _start, . - _start
+
+
+.if RENDER
+/* ============================================================
+ * Renderer only. No code/data/symbol references below survive RENDER=0.
+ * Build using the LED_MATRIX_0_* symbols exported by the GUI's actual
+ * 35x25 device. Each LED is RGB in bits 23:0 of a row-major word.
+ *
+ * Net face origins: U(9,2), L(0,9), F(9,9), R(18,9), B(27,9), D(9,16).
+ * Each face is 8x6; each sticker is 4x3. Separators: x=8,17,26,
+ * y=8,15. Two padding rows above and three below the 20-row net.
+ *
+ * Corner labels follow README.md and the C model:
+ * 0 UFL, 1 URF, 2 DFR, 3 DLF, 4 UBR, 5 DRB, 6 DBL, 7 ULB.
+ * Ordered sticker triples have consistent handedness. For destination
+ * slot k and C twist o, color = cubie_colors[cubie][(k+o) mod 3].
+ * These are geometry/palette tables, never a sequence of saved pictures.
+ * ============================================================ */
+#ifndef SOLVER_RENDER_DELAY
+#define SOLVER_RENDER_DELAY 5000000
+#endif
+.equ RENDER_DELAY, SOLVER_RENDER_DELAY
+
+.section .rodata,"a",@progbits
+.balign 4
+render_palette:
+    /* U white, D yellow, F green, B blue, L orange, R red. */
+    .word 0xffffff, 0xffff00, 0x00cc44, 0x2266ff, 0xff8800, 0xff2222
+render_cubie_colors:
+    .byte 0,2,4, 0,5,2, 1,2,5, 1,4,2
+    .byte 0,3,5, 1,5,3, 1,3,4, 0,4,3
+/* Verbatim C source[3][7] and twist[3][7]: destination takes source. */
+render_sources:
+    .byte 1,4,2,0,3,5,6
+    .byte 0,1,2,4,5,6,3
+    .byte 0,2,5,3,1,4,6
+render_twists:
+    .byte 1,2,0,2,1,0,0
+    .byte 0,0,0,1,2,1,2
+    .byte 0,0,0,0,0,0,0
+/* (corner, corner sticker slot, pixel x, pixel y); TL/TR/BL/BR. */
+render_facelets:
+    .byte 7,0,9,2,  4,0,13,2,  0,0,9,5,   1,0,13,5    /* U */
+    .byte 7,1,0,9,  0,2,4,9,   6,2,0,12,  3,1,4,12    /* L */
+    .byte 0,1,9,9,  1,2,13,9,  3,2,9,12,  2,1,13,12   /* F */
+    .byte 1,1,18,9, 4,2,22,9,  2,2,18,12, 5,1,22,12   /* R */
+    .byte 4,1,27,9, 7,2,31,9,  5,2,27,12, 6,1,31,12   /* B */
+    .byte 3,0,9,16, 2,0,13,16, 6,0,9,19,  5,0,13,19   /* D */
+
+.section .text,"ax",@progbits
+.balign 4
+
+/* a0=x, a1=y, a2=RGB. Clobbers t0..t2 only. Use the WIDTH symbol;
+ * 35*y = (y<<5)+(y<<1)+y. Refuse a different GUI matrix size. */
+.if LED_MATRIX_0_WIDTH != 35
+.error "Renderer requires LED Matrix Width=35"
+.endif
+.if LED_MATRIX_0_HEIGHT != 25
+.error "Renderer requires LED Matrix Height=25"
+.endif
+.type set_pixel, @function
+set_pixel:
+    slli    t0, a1, 5
+    slli    t1, a1, 1
+    add     t0, t0, t1
+    add     t0, t0, a1
+    add     t0, t0, a0
+    slli    t0, t0, 2
+    li      t2, LED_MATRIX_0_BASE
+    add     t0, t2, t0
+    sw      a2, 0(t0)
+    ret
+.size set_pixel, . - set_pixel
+
+.type clear_matrix, @function
+clear_matrix:
+    li      t0, LED_MATRIX_0_BASE
+    li      t1, LED_MATRIX_0_HEIGHT
+.Lclear_row:
+    li      t2, LED_MATRIX_0_WIDTH
+.Lclear_pixel:
+    sw      zero, 0(t0)
+    addi    t0, t0, 4
+    addi    t2, t2, -1
+    bnez    t2, .Lclear_pixel
+    addi    t1, t1, -1
+    bnez    t1, .Lclear_row
+    ret
+.size clear_matrix, . - clear_matrix
+
+/* Reconstruct the ORIGINAL cube_input, not search/replay's final ranks. */
+.type construct_concrete_cube, @function
+construct_concrete_cube:
+    la      t0, cube_input
+    la      t1, render_cube
+    li      t2, 14
+.Lconstruct_byte:
+    lbu     t3, 0(t0)
+    addi    t3, t3, -49
+    sb      t3, 0(t1)
+    addi    t0, t0, 1
+    addi    t1, t1, 1
+    addi    t2, t2, -1
+    bnez    t2, .Lconstruct_byte
+    ret
+.size construct_concrete_cube, . - construct_concrete_cube
+
+/* a0=actual move byte 0..8. Repeated C quarter turns, with a 14-byte
+ * scratch state to avoid overwriting a source cubie prematurely.
+ * Leaf routine: all s registers and ra survive; a and t registers are scratch. */
+.type apply_concrete_move, @function
+apply_concrete_move:
+    li      a1, 0
+    li      t0, 3
+    bltu    a0, t0, .Lconcrete_decoded
+    addi    a0, a0, -3
+    li      a1, 1
+    bltu    a0, t0, .Lconcrete_decoded
+    addi    a0, a0, -3
+    li      a1, 2
+.Lconcrete_decoded:
+    addi    t6, a0, 1
+    slli    t0, a1, 3
+    sub     t0, t0, a1     /* face * 7 */
+    la      a4, render_sources
+    add     a4, a4, t0
+    la      a5, render_twists
+    add     a5, a5, t0
+    la      a2, render_cube
+    la      a3, render_next
+.Lconcrete_quarter:
+    li      a7, 0
+.Lconcrete_cubie:
+    add     t0, a4, a7
+    lbu     t1, 0(t0)
+    add     t2, a2, t1
+    lbu     t3, 0(t2)
+    add     t4, a3, a7
+    sb      t3, 0(t4)
+    lbu     t3, 7(t2)
+    add     t0, a5, a7
+    lbu     t1, 0(t0)
+    add     t3, t3, t1
+    li      t0, 3
+    bltu    t3, t0, .Lconcrete_reduced
+    addi    t3, t3, -3
+.Lconcrete_reduced:
+    sb      t3, 7(t4)
+    addi    a7, a7, 1
+    li      t0, 7
+    bltu    a7, t0, .Lconcrete_cubie
+    li      a7, 0
+.Lconcrete_copy:
+    add     t0, a3, a7
+    lbu     t1, 0(t0)
+    add     t2, a2, a7
+    sb      t1, 0(t2)
+    addi    a7, a7, 1
+    li      t0, 14
+    bltu    a7, t0, .Lconcrete_copy
+    addi    t6, t6, -1
+    bnez    t6, .Lconcrete_quarter
+    ret
+.size apply_concrete_move, . - apply_concrete_move
+
+/* Clobbers s4..s8 and a/t registers; preserves render_solution's s0..s3.
+ * Every sticker derives its color from the live concrete corner state. */
+.type draw_cube, @function
+draw_cube:
+    mv      s8, ra
+    la      s4, render_facelets
+    li      s5, 24
+    la      s6, render_cube
+    la      s7, render_palette
+.Ldraw_sticker:
+    lbu     t0, 0(s4)      /* corner position 0..7 */
+    lbu     t1, 1(s4)      /* sticker slot 0..2 */
+    beqz    t0, .Ldraw_fixed_corner
+    add     t2, s6, t0
+    lbu     t0, -1(t2)     /* zero-based physical cubie */
+    addi    t0, t0, 1
+    lbu     t3, 6(t2)      /* twist at the same position */
+    add     t1, t1, t3
+    li      t3, 3
+    bltu    t1, t3, .Ldraw_fixed_corner
+    addi    t1, t1, -3
+.Ldraw_fixed_corner:
+    slli    t2, t0, 1
+    add     t2, t2, t0
+    add     t2, t2, t1
+    la      t3, render_cubie_colors
+    add     t2, t2, t3
+    lbu     t0, 0(t2)
+    slli    t0, t0, 2
+    add     t0, s7, t0
+    lw      a2, 0(t0)
+    lbu     a5, 2(s4)      /* rectangle origin x */
+    lbu     a6, 3(s4)      /* rectangle origin y */
+    li      a3, 0
+.Ldraw_sticker_row:
+    li      a4, 0
+.Ldraw_sticker_pixel:
+    add     a0, a5, a4
+    add     a1, a6, a3
+    jal     ra, set_pixel
+    addi    a4, a4, 1
+    li      t0, 4
+    bltu    a4, t0, .Ldraw_sticker_pixel
+    addi    a3, a3, 1
+    li      t0, 3
+    bltu    a3, t0, .Ldraw_sticker_row
+    addi    s4, s4, 4
+    addi    s5, s5, -1
+    bnez    s5, .Ldraw_sticker
+    jalr    zero, 0(s8)
+.size draw_cube, . - draw_cube
+
+.type render_delay, @function
+render_delay:
+    li      t0, RENDER_DELAY
+    beqz    t0, .Ldelay_done
+.Ldelay_loop:
+    addi    t0, t0, -1
+    bnez    t0, .Ldelay_loop
+.Ldelay_done:
+    ret
+.size render_delay, . - render_delay
+
+/* This internal routine runs after ranked replay and owns s0..s8.
+ * Initial frame, then exactly one redraw per solution_path byte.
+ * Independent concrete solved check is exposed for GUI inspection. */
+.type render_solution, @function
+render_solution:
+    mv      s3, ra
+    la      s0, solution_path
+    la      t0, solution_length
+    lw      s1, 0(t0)
+    li      s2, 0
+    la      t0, render_moves
+    sw      zero, 0(t0)
+    la      t0, render_validation_result
+    sw      zero, 0(t0)
+    jal     ra, construct_concrete_cube
+    jal     ra, clear_matrix
+    jal     ra, draw_cube
+    jal     ra, render_delay
+.Lrender_move:
+    beqz    s1, .Lrender_finished
+    lbu     a0, 0(s0)
+    jal     ra, apply_concrete_move
+    jal     ra, draw_cube
+    addi    s0, s0, 1
+    addi    s1, s1, -1
+    addi    s2, s2, 1
+    la      t0, render_moves
+    sw      s2, 0(t0)
+    jal     ra, render_delay
+    j       .Lrender_move
+.Lrender_finished:
+    la      t0, render_cube
+    li      t1, 0
+    li      a0, 0
+.Lrender_check_cubie:
+    lbu     t2, 0(t0)
+    bne     t2, t1, .Lrender_checked
+    lbu     t2, 7(t0)
+    bnez    t2, .Lrender_checked
+    addi    t0, t0, 1
+    addi    t1, t1, 1
+    li      t2, 7
+    bltu    t1, t2, .Lrender_check_cubie
+    li      a0, 1
+.Lrender_checked:
+    la      t0, render_validation_result
+    sw      a0, 0(t0)
+    jalr    zero, 0(s3)
+.size render_solution, . - render_solution
+.endif
